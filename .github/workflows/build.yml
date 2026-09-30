@@ -1,0 +1,119 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: App display name
+        required: true
+        default: My App
+      app_url:
+        description: Website URL
+        required: true
+        default: https://example.com
+      package_name:
+        description: Android package name
+        required: true
+        default: com.web.app
+      logo_url:
+        description: Direct URL to PNG logo
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      APP_URL: ${{ inputs.app_url }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      LOGO_URL: ${{ inputs.logo_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK Platform 35 and Build Tools
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - name: Validate inputs and customize project
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          name = os.environ['APP_NAME'].strip()
+          url = os.environ['APP_URL'].strip()
+          package = os.environ['PACKAGE_NAME'].strip()
+          if not name: raise SystemExit('app_name must not be empty')
+          if not re.fullmatch(r'https?://[^\s]+', url, re.I): raise SystemExit('app_url must be HTTP or HTTPS')
+          if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+', package): raise SystemExit('package_name is not a valid-looking Android application ID')
+          config = {'appName': name, 'appUrl': url, 'packageName': package}
+          Path('app/src/main/assets/config.json').write_text(json.dumps(config, indent=2) + '\\n', encoding='utf-8')
+          gradle = Path('app/build.gradle').read_text()
+          gradle = re.sub(r"applicationId '[^']+'", "applicationId '" + package + "'", gradle, count=1)
+          Path('app/build.gradle').write_text(gradle)
+          strings = Path('app/src/main/res/values/strings.xml').read_text()
+          safe_name = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          strings = re.sub(r'<string name="app_name">.*?</string>', f'<string name="app_name">{safe_name}</string>', strings)
+          Path('app/src/main/res/values/strings.xml').write_text(strings)
+          PY
+      - name: Download and generate launcher icons
+        if: ${{ env.LOGO_URL != '' }}
+        shell: bash
+        run: |
+          mkdir -p .build-assets
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 30 "$LOGO_URL" --output .build-assets/logo.png
+          python3 -m pip install --user --quiet pillow
+          LOGO_FILE="$GITHUB_WORKSPACE/.build-assets/logo.png" python3 scripts/generate_icons.py
+      - name: Generate temporary release signing key
+        shell: bash
+        run: |
+          mkdir -p .build-assets
+          keytool -genkeypair -v \
+            -keystore .build-assets/release.keystore \
+            -storepass temporary \
+            -keypass temporary \
+            -alias web2app \
+            -keyalg RSA -keysize 2048 -validity 1 \
+            -dname 'CN=Web2App Temporary,O=Web2App,C=US'
+          cat > keystore.properties <<'PROPERTIES'
+          storeFile=.build-assets/release.keystore
+          storePassword=temporary
+          keyAlias=web2app
+          keyPassword=temporary
+          PROPERTIES
+      - name: Build release APK
+        run: ./gradlew --no-daemon --stacktrace assembleRelease
+      - name: Rename APK
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, shutil
+          from pathlib import Path
+          safe = re.sub(r'[^A-Za-z0-9._-]+', '_', os.environ['APP_NAME'].strip()).strip('._') or 'app'
+          apk = next(Path('app/build/outputs/apk/release').glob('*.apk'))
+          shutil.copy2(apk, Path('app/build/outputs/apk/release') / f'{safe}.apk')
+          PY
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: app/build/outputs/apk/release/*.apk
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ${{ env.APP_NAME }} build ${{ github.run_number }}
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
